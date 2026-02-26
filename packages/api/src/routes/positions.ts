@@ -3,7 +3,7 @@ import { db } from '../index.js';
 
 export default async function positionsRoutes(app: FastifyInstance) {
   // List open positions
-  app.get<{ Querystring: { accountId?: string; open?: boolean } }>('/', async (request) => {
+  app.get<{ Querystring: { accountId?: string; open?: string } }>('/', async (request) => {
     const { accountId, open } = request.query;
     let query = `
       SELECT p.*, m.symbol as market_symbol, m.name as market_name, m.type as market_type
@@ -18,7 +18,7 @@ export default async function positionsRoutes(app: FastifyInstance) {
       query += ` AND p.account_id = $${params.length}`;
     }
     if (open !== undefined) {
-      params.push(open === true || open === 'true');
+      params.push(open === 'true');
       query += ` AND p.is_open = $${params.length}`;
     }
     
