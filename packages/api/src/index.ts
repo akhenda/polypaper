@@ -32,6 +32,7 @@ import strategiesRoutes from './routes/strategies.js';
 import dashboardRoutes from './routes/dashboard.js';
 import indicatorsRoutes from './routes/indicators.js';
 import polymarketRoutes from './routes/polymarket.js';
+import backtestsRoutes from './routes/backtests.js';
 
 app.register(accountsRoutes, { prefix: '/api/v1/accounts' });
 app.register(ordersRoutes, { prefix: '/api/v1/orders' });
@@ -41,6 +42,7 @@ app.register(strategiesRoutes, { prefix: '/api/v1/strategies' });
 app.register(dashboardRoutes, { prefix: '/api/v1/dashboard' });
 app.register(indicatorsRoutes, { prefix: '/api/v1' });
 app.register(polymarketRoutes, { prefix: '/api/v1' });
+app.register(backtestsRoutes, { prefix: '/api/v1' });
 
 // Start server
 const start = async () => {
