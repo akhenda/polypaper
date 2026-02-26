@@ -8,6 +8,7 @@ Used to discover active prediction markets and their metadata.
 """
 import os
 import time
+import json
 import logging
 import requests
 from typing import Dict, Any, List, Optional
@@ -133,30 +134,47 @@ def extract_market_info(market: Dict) -> Dict[str, Any]:
     - token_ids: CLOB token IDs for each outcome
     - active: Whether market is active
     """
+    # Get token IDs - handle different field names and formats
+    token_ids = market.get("clobTokenIds") or market.get("clob_token_ids") or []
+    
+    # Token IDs may be a JSON string or already a list
+    if isinstance(token_ids, str):
+        try:
+            token_ids = json.loads(token_ids)
+        except (json.JSONDecodeError, ValueError):
+            token_ids = []
+    
+    # If still empty, check tokens array
+    if not token_ids and isinstance(market.get("tokens"), list):
+        token_ids = [t.get("token_id") or t.get("clobTokenId") for t in market["tokens"] if t]
+    
+    # Clean up token IDs
+    token_ids = [str(tid) for tid in token_ids if tid]
+    
     return {
-        "market_id": market.get("id") or market.get("condition_id"),
+        "market_id": str(market.get("id") or market.get("conditionId", "")),
         "question": market.get("question"),
-        "slug": market.get("market_slug") or market.get("slug"),
+        "slug": market.get("slug"),
         "outcomes": market.get("outcomes", []),
-        "outcome_prices": market.get("outcome_prices", []),
-        "token_ids": market.get("clob_token_ids", market.get("tokens", [])),
+        "outcome_prices": market.get("outcomePrices") or market.get("outcome_prices", []),
+        "token_ids": token_ids,
         "active": market.get("active", True),
-        "closed": market.get("resolved", False),
-        "end_date": market.get("end_date_iso"),
-        "volume": market.get("volume"),
-        "event_id": market.get("event_id") or market.get("condition_id"),
-        "event_slug": market.get("event_slug"),
+        "closed": market.get("resolved") or market.get("closed", False),
+        "end_date": market.get("endDateIso") or market.get("end_date_iso"),
+        "volume": market.get("volume") or market.get("volumeNum"),
+        "event_id": market.get("events", [{}])[0].get("id") if market.get("events") else market.get("event_id"),
+        "event_slug": market.get("events", [{}])[0].get("slug") if market.get("events") else market.get("event_slug"),
         "image": market.get("image"),
         "description": market.get("description"),
     }
 
 
-def discover_active_markets(max_events: int = 200) -> List[Dict[str, Any]]:
+def discover_active_markets(max_markets: int = 500) -> List[Dict[str, Any]]:
     """
-    Discover all active markets by paginating through events.
+    Discover all active markets by fetching directly from /markets endpoint.
     
     Args:
-        max_events: Maximum number of events to scan
+        max_markets: Maximum number of markets to fetch
     
     Returns:
         List of extracted market info dicts
@@ -165,38 +183,37 @@ def discover_active_markets(max_events: int = 200) -> List[Dict[str, Any]]:
     offset = 0
     limit = 100
     
-    while offset < max_events:
-        logger.info(f"Fetching events offset={offset}")
-        events = fetch_events(active=True, closed=False, limit=limit, offset=offset)
+    while len(all_markets) < max_markets:
+        logger.info(f"Fetching markets offset={offset}, total={len(all_markets)}")
         
-        if not events:
+        # Use /markets endpoint which has clobTokenIds
+        params = {
+            "limit": limit,
+            "offset": offset,
+            "active": "true",
+            "closed": "false"
+        }
+        
+        data = _make_request("/markets", params)
+        
+        if not data or not isinstance(data, list):
             break
         
-        for event in events:
-            # Extract markets from event
-            event_markets = event.get("markets", [])
-            
-            if not event_markets:
-                # Single market event
-                market_info = extract_market_info(event)
-                if market_info["market_id"]:
-                    all_markets.append(market_info)
-            else:
-                # Multiple markets per event
-                for market in event_markets:
-                    market["event_slug"] = event.get("slug")
-                    market["event_id"] = event.get("id")
-                    market_info = extract_market_info(market)
-                    if market_info["market_id"]:
-                        all_markets.append(market_info)
+        for market in data:
+            market_info = extract_market_info(market)
+            if market_info["market_id"] and market_info.get("token_ids"):
+                all_markets.append(market_info)
         
         offset += limit
         
-        if len(events) < limit:
+        if len(data) < limit:
+            break
+        
+        if len(all_markets) >= max_markets:
             break
     
-    logger.info(f"Discovered {len(all_markets)} active markets")
-    return all_markets
+    logger.info(f"Discovered {len(all_markets)} active markets with token IDs")
+    return all_markets[:max_markets]
 
 
 if __name__ == "__main__":

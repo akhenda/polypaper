@@ -160,7 +160,7 @@ def sync_markets():
     logger.info("Starting Polymarket market discovery...")
     
     try:
-        markets = discover_active_markets(max_events=100)
+        markets = discover_active_markets(max_markets=100)
         
         synced_count = 0
         for market_info in markets:
