@@ -141,8 +141,8 @@ export default async function polymarketRoutes(app: FastifyInstance) {
     }
   });
 
-  // Get latest price for a market
-  app.get<{ Params: { id: string } }>('/markets/:id/price', async (request) => {
+  // Get latest price for a market (extended with Polymarket metadata)
+  app.get<{ Params: { id: string } }>('/markets/:id/polymarket/price', async (request) => {
     const { id } = request.params;
     
     const client = await db.connect();
