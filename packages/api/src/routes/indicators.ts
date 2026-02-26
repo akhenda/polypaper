@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
-import { Pool } from 'pg';
+import { db } from '../index.js';
 
-export default async function indicatorsRoutes(app: FastifyInstance, db: Pool) {
+export default async function indicatorsRoutes(app: FastifyInstance) {
   // Get latest indicators for a market
   app.get<{
     Querystring: { market_id?: string; symbol?: string; interval?: string };
