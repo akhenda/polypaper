@@ -1,4 +1,4 @@
 # Backtest module
-from .runner import BacktestEngine, BacktestResult, BacktestTrade, run_backtest, format_backtest_report
+from .runner import run_backtest, save_backtest_result, BacktestEngine, BacktestResult
 
-__all__ = ["BacktestEngine", "BacktestResult", "BacktestTrade", "run_backtest", "format_backtest_report"]
+__all__ = ["run_backtest", "save_backtest_result", "BacktestEngine", "BacktestResult"]
