@@ -206,6 +206,7 @@ def ensure_strategy_instance(account_id: str) -> Optional[str]:
                 VALUES (%s, %s, %s, true)
                 RETURNING id
             """, (account_id, strategy_id, json.dumps(default_params)))
+            row = cur.fetchone()
             
             # Ensure strategy_state row exists
             cur.execute("""
@@ -215,7 +216,6 @@ def ensure_strategy_instance(account_id: str) -> Optional[str]:
             """, (account_id, strategy_id))
             
             conn.commit()
-            row = cur.fetchone()
             return str(row["id"]) if row else None
 
 
