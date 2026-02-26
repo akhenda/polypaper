@@ -30,6 +30,7 @@ import positionsRoutes from './routes/positions.js';
 import marketsRoutes from './routes/markets.js';
 import strategiesRoutes from './routes/strategies.js';
 import dashboardRoutes from './routes/dashboard.js';
+import indicatorsRoutes from './routes/indicators.js';
 
 app.register(accountsRoutes, { prefix: '/api/v1/accounts' });
 app.register(ordersRoutes, { prefix: '/api/v1/orders' });
@@ -37,6 +38,7 @@ app.register(positionsRoutes, { prefix: '/api/v1/positions' });
 app.register(marketsRoutes, { prefix: '/api/v1/markets' });
 app.register(strategiesRoutes, { prefix: '/api/v1/strategies' });
 app.register(dashboardRoutes, { prefix: '/api/v1/dashboard' });
+app.register(indicatorsRoutes, { prefix: '/api/v1' });
 
 // Start server
 const start = async () => {

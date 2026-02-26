@@ -72,6 +72,58 @@ strategies_config = [
 - `width > 8%` = expansion (high volatility)
 - Used by Mean Reversion strategy
 
+### RSI (Relative Strength Index)
+- Momentum oscillator (0-100)
+- `RSI > 70` = overbought
+- `RSI < 30` = oversold
+- Calculated for all intervals
+
+## Timeframes & Indicators (Phase 2.1)
+
+### Candle Intervals
+The system maintains candles for multiple timeframes:
+- **1m** - Source candles, fetched from Binance every minute
+- **15m** - Aggregated from 1m candles
+- **4h** - Aggregated from 1m candles
+
+### Strategy-to-Timeframe Mapping
+
+| Strategy | Candle Interval | Why |
+|----------|-----------------|-----|
+| Late Entry | 1m | Needs fast reaction to volatility |
+| Mean Reversion | 15m | Balances signal quality with frequency |
+| Trend Following | 4h | Captures longer-term trends |
+
+### Indicator Computation
+
+Indicators are computed **only when a new candle is created** for that interval:
+
+- **ADX (14-period)** - Requires ~28 candles before valid
+- **Bollinger Bands (20, 2σ)** - Requires 20+ candles
+- **RSI (14-period)** - Requires 15+ candles
+
+Indicators are stored in `market_indicators` table with `(market_id, interval, timestamp)` unique constraint.
+
+### API Endpoints for Indicators
+
+```bash
+# Get latest indicators for a market
+curl "localhost:3001/api/v1/indicators?symbol=BTC-USD&interval=15m"
+
+# Get indicator history
+curl "localhost:3001/api/v1/indicators/history?symbol=BTC-USD&interval=1h&limit=50"
+
+# Get latest candle
+curl "localhost:3001/api/v1/candles/latest?symbol=BTC-USD&interval=4h"
+```
+
+### Data Freshness
+
+Strategy state tracks:
+- `last_candle_at` - When the last candle for its interval was received
+- `last_run_at` - When the strategy last ran
+- `cooldown_until` - If circuit breaker is active
+
 ## Backtesting (Phase 2C)
 
 Run backtests from the worker container:

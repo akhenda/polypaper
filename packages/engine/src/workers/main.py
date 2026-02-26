@@ -1,8 +1,10 @@
 """
-Polypaper Strategy Runner Worker (Phase 2A)
+Polypaper Strategy Runner Worker (Phase 2.1)
 
-Runs multiple strategies with different intervals for paper trading.
-Fetches market data, executes strategies, manages paper positions.
+Event-driven multi-timeframe strategy runner.
+- Maintains candles for 1m, 15m, 4h intervals
+- Computes indicators only when new candles are created
+- Strategies use candles aligned to their declared timeframe
 """
 import os
 import sys
@@ -12,7 +14,7 @@ import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional, Dict, Any, List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -23,9 +25,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from strategies.base import MarketData, Position, Signal, SignalType
 from strategies import STRATEGY_REGISTRY
-from strategies.examples import LateEntryStrategy, TrendFollowingStrategy, MeanReversionStrategy
 from indicators.adx import calculate_adx, get_trend_direction
 from indicators.bollinger import calculate_bollinger_bands
+from indicators.rsi import calculate_rsi
+from data.candle_aggregator import aggregate_all_timeframes, get_bucket_start
 
 # Configure logging
 logging.basicConfig(
@@ -43,6 +46,7 @@ COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "24"))
 
 # Binance API config
 BINANCE_API_URL = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 BINANCE_RATE_LIMIT_DELAY = 0.5
 BINANCE_TIMEOUT = 10
 last_binance_request = 0
@@ -53,6 +57,13 @@ BINANCE_SYMBOL_MAP = {
     "ETH-USD": "ETHUSDT",
 }
 
+# Strategy to interval mapping
+STRATEGY_INTERVALS = {
+    "late-entry-v1": "1m",
+    "mean-reversion-v1": "15m",
+    "trend-following-v1": "4h",
+}
+
 
 @dataclass
 class StrategyInstance:
@@ -61,10 +72,12 @@ class StrategyInstance:
     account_id: str
     strategy_id: str
     parameters: Dict[str, Any]
-    interval_seconds: int
+    interval: str  # Candle interval (1m, 15m, 4h)
+    interval_seconds: int  # How often to run strategy
     last_run: Optional[datetime]
+    last_candle_time: Optional[datetime]
     state: Dict[str, Any]
-    strategy_obj: Any  # The actual strategy class instance
+    strategy_obj: Any
 
 
 def get_db_connection():
@@ -73,7 +86,7 @@ def get_db_connection():
 
 
 def fetch_binance_price(symbol: str) -> Optional[Decimal]:
-    """Fetch current price from Binance public API with rate limiting."""
+    """Fetch current price from Binance with rate limiting."""
     global last_binance_request
     
     binance_symbol = BINANCE_SYMBOL_MAP.get(symbol)
@@ -99,34 +112,31 @@ def fetch_binance_price(symbol: str) -> Optional[Decimal]:
             
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 60))
-                logger.warning(f"Binance rate limited, waiting {retry_after}s")
+                logger.warning(f"Binance 429, waiting {retry_after}s")
                 time.sleep(retry_after)
                 continue
             
             if resp.status_code == 418:
-                logger.error("Binance IP banned, waiting 5 minutes")
+                logger.error("Binance 418 IP banned, waiting 5 minutes")
                 time.sleep(300)
                 continue
             
             resp.raise_for_status()
             data = resp.json()
-            price = Decimal(str(data["price"]))
-            return price
+            return Decimal(str(data["price"]))
             
         except requests.exceptions.Timeout:
-            logger.warning(f"Binance timeout for {symbol} (attempt {attempt + 1})")
+            logger.warning(f"Binance timeout (attempt {attempt + 1})")
             if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                time.sleep(delay)
+                time.sleep(base_delay * (2 ** attempt))
             else:
-                log_error("binance", f"Timeout fetching {symbol}", None, {"symbol": symbol})
+                log_error("binance", f"Timeout", None, {"symbol": symbol})
                 return None
                 
         except requests.exceptions.RequestException as e:
-            logger.error(f"Binance request error: {e}")
+            logger.error(f"Binance error: {e}")
             if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                time.sleep(delay)
+                time.sleep(base_delay * (2 ** attempt))
             else:
                 log_error("binance", str(e), None, {"symbol": symbol})
                 return None
@@ -145,11 +155,11 @@ def log_error(source: str, message: str, stack_trace: str = None, context: dict 
                 """, (source, message, stack_trace, json.dumps(context or {})))
                 conn.commit()
     except Exception as e:
-        logger.error(f"Failed to log error to DB: {e}")
+        logger.error(f"Failed to log error: {e}")
 
 
 def log_trade(account_id: str, order_id: str, position_id: str, action: str, details: dict):
-    """Log trade action to trade_log table."""
+    """Log trade action."""
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
@@ -171,7 +181,7 @@ def ensure_active_account() -> Optional[str]:
             if row:
                 return str(row["id"])
             
-            logger.info("No active account found, creating default...")
+            logger.info("Creating default account...")
             cur.execute("""
                 INSERT INTO accounts (name, currency, initial_balance, current_balance, is_active)
                 VALUES ('Main Paper Account', 'USD', 10000, 10000, true)
@@ -191,71 +201,81 @@ def get_market_id(symbol: str) -> Optional[str]:
             return str(row["id"]) if row else None
 
 
-def get_or_create_candle(market_id: str, symbol: str) -> Optional[MarketData]:
-    """Get latest candle or create one from current price."""
+def get_latest_candle_time(market_id: str, interval: str) -> Optional[datetime]:
+    """Get the timestamp of the latest candle for an interval."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT timestamp, open, high, low, close, volume 
-                FROM market_candles 
-                WHERE market_id = %s AND interval = '1m'
-                ORDER BY timestamp DESC LIMIT 1
-            """, (market_id,))
+                SELECT MAX(timestamp) as latest
+                FROM market_candles
+                WHERE market_id = %s AND interval = %s
+            """, (market_id, interval))
             row = cur.fetchone()
-            
-            if row:
-                return MarketData(
-                    symbol=symbol,
-                    timestamp=int(row["timestamp"].timestamp() * 1000),
-                    open=Decimal(str(row["open"])),
-                    high=Decimal(str(row["high"])),
-                    low=Decimal(str(row["low"])),
-                    close=Decimal(str(row["close"])),
-                    volume=Decimal(str(row["volume"]))
-                )
+            return row["latest"] if row else None
+
+
+def insert_1m_candle(market_id: str, symbol: str) -> tuple:
+    """
+    Insert a new 1m candle from current price.
     
+    Returns: (candle_time, is_new) - the candle timestamp and whether it's new
+    """
     price = fetch_binance_price(symbol)
     if price is None:
-        return None
+        return None, False
     
     candle_time = datetime.utcnow().replace(second=0, microsecond=0)
     
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            # Check if candle already exists
+            cur.execute("""
+                SELECT 1 FROM market_candles
+                WHERE market_id = %s AND interval = '1m' AND timestamp = %s
+            """, (market_id, candle_time))
+            exists = cur.fetchone()
+            
+            if exists:
+                # Update existing candle
+                cur.execute("""
+                    UPDATE market_candles
+                    SET close = %s, high = GREATEST(high, %s), low = LEAST(low, %s)
+                    WHERE market_id = %s AND interval = '1m' AND timestamp = %s
+                """, (price, price, price, market_id, candle_time))
+                conn.commit()
+                return candle_time, False
+            
+            # Insert new candle
             cur.execute("""
                 INSERT INTO market_candles (market_id, interval, timestamp, open, high, low, close, volume)
                 VALUES (%s, '1m', %s, %s, %s, %s, %s, 0)
-                ON CONFLICT (market_id, interval, timestamp) DO UPDATE
-                SET close = EXCLUDED.close
             """, (market_id, candle_time, price, price, price, price))
             conn.commit()
-    
-    logger.info(f"Created candle for {symbol} at {price}")
-    
-    return MarketData(
-        symbol=symbol,
-        timestamp=int(time.time() * 1000),
-        open=price,
-        high=price,
-        low=price,
-        close=price,
-        volume=Decimal("0")
-    )
+            
+            logger.info(f"New 1m candle for {symbol}: {price}")
+            return candle_time, True
 
 
-def get_candle_history(market_id: str, limit: int = 50) -> List[MarketData]:
-    """Get historical candles for indicator calculation."""
+def aggregate_timeframes(market_id: str):
+    """Aggregate 1m candles into higher timeframes."""
+    results = aggregate_all_timeframes(DATABASE_URL, market_id)
+    for tf, count in results.items():
+        if count > 0:
+            logger.info(f"Aggregated {count} {tf} candles")
+
+
+def get_candle_history(market_id: str, interval: str, limit: int = 50) -> List[MarketData]:
+    """Get historical candles for a specific interval."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT timestamp, open, high, low, close, volume 
                 FROM market_candles 
-                WHERE market_id = %s AND interval = '1m'
+                WHERE market_id = %s AND interval = %s
                 ORDER BY timestamp DESC LIMIT %s
-            """, (market_id, limit))
+            """, (market_id, interval, limit))
             rows = cur.fetchall()
             
-            # Reverse to get oldest first
             rows = list(reversed(rows))
             
             return [
@@ -272,8 +292,85 @@ def get_candle_history(market_id: str, limit: int = 50) -> List[MarketData]:
             ]
 
 
+def compute_and_save_indicators(market_id: str, interval: str, candle_time: datetime):
+    """Compute indicators for a specific interval when new candle arrives."""
+    # Get enough history for all indicators (ADX needs ~28 candles)
+    candles = get_candle_history(market_id, interval, limit=50)
+    
+    if len(candles) < 28:
+        logger.debug(f"Not enough candles ({len(candles)}) for {interval} indicators")
+        return
+    
+    highs = [c.high for c in candles]
+    lows = [c.low for c in candles]
+    closes = [c.close for c in candles]
+    
+    # Calculate indicators
+    adx_result = calculate_adx(highs, lows, closes, period=14)
+    bb_result = calculate_bollinger_bands(closes, period=20, num_std=2.0)
+    rsi_result = calculate_rsi(closes, period=14)
+    
+    adx_val = None
+    adx_trend = None
+    bb_upper = bb_middle = bb_lower = bb_width = None
+    rsi_val = None
+    
+    if adx_result:
+        adx, plus_di, minus_di = adx_result
+        adx_val = float(adx)
+        adx_trend = get_trend_direction(adx, plus_di, minus_di)
+    
+    if bb_result:
+        upper, middle, lower, width = bb_result
+        bb_upper = float(upper)
+        bb_middle = float(middle)
+        bb_lower = float(lower)
+        bb_width = float(width)
+    
+    if rsi_result:
+        rsi_val = float(rsi_result)
+    
+    # Save to database
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO market_indicators 
+                    (market_id, interval, timestamp, adx, adx_trend, 
+                     bb_upper, bb_middle, bb_lower, bb_width, rsi)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (market_id, interval, timestamp) DO UPDATE SET
+                    adx = EXCLUDED.adx,
+                    adx_trend = EXCLUDED.adx_trend,
+                    bb_upper = EXCLUDED.bb_upper,
+                    bb_middle = EXCLUDED.bb_middle,
+                    bb_lower = EXCLUDED.bb_lower,
+                    bb_width = EXCLUDED.bb_width,
+                    rsi = EXCLUDED.rsi
+            """, (
+                market_id, interval, candle_time,
+                adx_val, adx_trend,
+                bb_upper, bb_middle, bb_lower, bb_width, rsi_val
+            ))
+            conn.commit()
+    
+    logger.info(f"Computed {interval} indicators: ADX={adx_val}, BB_width={bb_width}, RSI={rsi_val}")
+
+
+def get_latest_indicators(market_id: str, interval: str) -> Optional[Dict]:
+    """Get latest indicators for a market/interval."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT * FROM market_indicators
+                WHERE market_id = %s AND interval = %s
+                ORDER BY timestamp DESC LIMIT 1
+            """, (market_id, interval))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
 def get_open_positions(account_id: str, market_id: str = None) -> List[Position]:
-    """Get open positions as Position objects."""
+    """Get open positions."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             if market_id:
@@ -291,7 +388,6 @@ def get_open_positions(account_id: str, market_id: str = None) -> List[Position]
                     WHERE p.account_id = %s AND p.is_open = true
                 """, (account_id,))
             
-            rows = cur.fetchall()
             return [
                 Position(
                     symbol=row["symbol"],
@@ -299,20 +395,18 @@ def get_open_positions(account_id: str, market_id: str = None) -> List[Position]
                     quantity=Decimal(str(row["quantity"])),
                     avg_entry_price=Decimal(str(row["avg_entry_price"]))
                 )
-                for row in rows
+                for row in cur.fetchall()
             ]
 
 
-def get_strategy_state(account_id: str, strategy_id: str) -> Dict[str, Any]:
-    """Get strategy state from DB."""
+def get_strategy_state(instance_id: str) -> Dict[str, Any]:
+    """Get strategy state by instance ID."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT consecutive_losses, last_loss_at, cooldown_until, 
-                       total_trades, winning_trades, total_losses, total_pnl, max_drawdown
-                FROM strategy_state
-                WHERE account_id = %s AND strategy_id = %s
-            """, (account_id, strategy_id))
+                SELECT * FROM strategy_state
+                WHERE strategy_instance_id = %s
+            """, (instance_id,))
             row = cur.fetchone()
             if row:
                 return {
@@ -337,8 +431,8 @@ def get_strategy_state(account_id: str, strategy_id: str) -> Dict[str, Any]:
             }
 
 
-def update_strategy_state(account_id: str, strategy_id: str, state: Dict[str, Any]):
-    """Update strategy state in DB."""
+def update_strategy_state(instance_id: str, state: Dict[str, Any]):
+    """Update strategy state."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -352,7 +446,7 @@ def update_strategy_state(account_id: str, strategy_id: str, state: Dict[str, An
                     total_pnl = %s,
                     max_drawdown = %s,
                     updated_at = NOW()
-                WHERE account_id = %s AND strategy_id = %s
+                WHERE strategy_instance_id = %s
             """, (
                 state.get("consecutive_losses", 0),
                 state.get("last_loss_at"),
@@ -362,88 +456,57 @@ def update_strategy_state(account_id: str, strategy_id: str, state: Dict[str, An
                 state.get("total_losses", 0),
                 state.get("total_pnl", 0),
                 state.get("max_drawdown", 0),
-                account_id, strategy_id
-            ))
-            conn.commit()
-
-
-def save_market_indicators(market_id: str, data: MarketData, 
-                           adx: float = None, bb_data: dict = None):
-    """Save calculated indicators to DB."""
-    candle_time = datetime.utcnow().replace(second=0, microsecond=0)
-    
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO market_indicators 
-                    (market_id, interval, timestamp, adx, adx_trend, bb_upper, bb_middle, bb_lower, bb_width)
-                VALUES (%s, '1m', %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (market_id, interval, timestamp) DO UPDATE SET
-                    adx = EXCLUDED.adx,
-                    adx_trend = EXCLUDED.adx_trend,
-                    bb_upper = EXCLUDED.bb_upper,
-                    bb_middle = EXCLUDED.bb_middle,
-                    bb_lower = EXCLUDED.bb_lower,
-                    bb_width = EXCLUDED.bb_width
-            """, (
-                market_id, candle_time,
-                adx,
-                bb_data.get("trend") if bb_data else None,
-                bb_data.get("upper") if bb_data else None,
-                bb_data.get("middle") if bb_data else None,
-                bb_data.get("lower") if bb_data else None,
-                bb_data.get("width") if bb_data else None
+                instance_id
             ))
             conn.commit()
 
 
 def execute_paper_order(account_id: str, market_id: str, signal: Signal,
-                        strategy_id: str, current_price: Decimal) -> bool:
-    """Execute paper order - directly fills at current price."""
+                        strategy_id: str, instance_id: str, current_price: Decimal) -> bool:
+    """Execute paper order."""
     now = datetime.utcnow()
     
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO orders (account_id, market_id, strategy_id, side, type, quantity, price, 
-                                       filled_quantity, avg_fill_price, status, filled_at)
-                    VALUES (%s, %s, %s, %s, 'MARKET', %s, %s, %s, %s, 'FILLED', %s)
-                    RETURNING id
-                """, (
-                    account_id, market_id, strategy_id,
-                    "BUY" if signal.signal_type == SignalType.BUY else "SELL",
-                    signal.quantity, current_price,
-                    signal.quantity, current_price, now
-                ))
-                order_row = cur.fetchone()
-                order_id = str(order_row["id"]) if order_row else None
-                
                 if signal.signal_type == SignalType.BUY:
                     cost = signal.quantity * current_price
                     
                     cur.execute("SELECT current_balance FROM accounts WHERE id = %s", (account_id,))
                     balance_row = cur.fetchone()
                     if not balance_row or Decimal(str(balance_row["current_balance"])) < cost:
-                        logger.warning(f"Insufficient balance for order")
-                        conn.rollback()
+                        logger.warning(f"Insufficient balance")
                         return False
                     
+                    # Deduct balance
                     cur.execute("""
-                        UPDATE accounts SET current_balance = current_balance - %s, updated_at = NOW()
+                        UPDATE accounts SET current_balance = current_balance - %s
                         WHERE id = %s
                     """, (cost, account_id))
                     
+                    # Create order
                     cur.execute("""
-                        INSERT INTO positions (account_id, market_id, strategy_id, side, quantity, avg_entry_price, is_open)
+                        INSERT INTO orders (account_id, market_id, strategy_id, side, type, 
+                                           quantity, price, filled_quantity, avg_fill_price, 
+                                           status, filled_at)
+                        VALUES (%s, %s, %s, 'BUY', 'MARKET', %s, %s, %s, %s, 'FILLED', %s)
+                        RETURNING id
+                    """, (account_id, market_id, strategy_id, signal.quantity, current_price,
+                          signal.quantity, current_price, now))
+                    order_row = cur.fetchone()
+                    order_id = str(order_row["id"]) if order_row else None
+                    
+                    # Create position
+                    cur.execute("""
+                        INSERT INTO positions (account_id, market_id, strategy_id, side, 
+                                              quantity, avg_entry_price, is_open)
                         VALUES (%s, %s, %s, 'LONG', %s, %s, true)
                         RETURNING id
                     """, (account_id, market_id, strategy_id, signal.quantity, current_price))
                     pos_row = cur.fetchone()
                     position_id = str(pos_row["id"]) if pos_row else None
                     
-                    logger.info(f"Opened LONG position: {signal.quantity} @ {current_price}")
-                    
+                    logger.info(f"Opened LONG: {signal.quantity} @ {current_price}")
                     log_trade(account_id, order_id, position_id, "OPEN_LONG", {
                         "symbol": signal.symbol,
                         "quantity": str(signal.quantity),
@@ -451,7 +514,7 @@ def execute_paper_order(account_id: str, market_id: str, signal: Signal,
                         "strategy": strategy_id,
                         "reason": signal.reason
                     })
-                
+                    
                 elif signal.signal_type == SignalType.CLOSE_LONG:
                     cur.execute("""
                         SELECT id, quantity, avg_entry_price 
@@ -461,8 +524,7 @@ def execute_paper_order(account_id: str, market_id: str, signal: Signal,
                     pos_row = cur.fetchone()
                     
                     if not pos_row:
-                        logger.warning(f"No open position to close")
-                        conn.rollback()
+                        logger.warning("No position to close")
                         return False
                     
                     position_id = str(pos_row["id"])
@@ -470,19 +532,30 @@ def execute_paper_order(account_id: str, market_id: str, signal: Signal,
                     quantity = Decimal(str(pos_row["quantity"]))
                     
                     proceeds = quantity * current_price
-                    cost_basis = quantity * entry_price
-                    pnl = proceeds - cost_basis
+                    pnl = proceeds - (quantity * entry_price)
                     
+                    # Close position
                     cur.execute("""
                         UPDATE positions 
                         SET is_open = false, closed_at = %s, realized_pnl = %s
                         WHERE id = %s
                     """, (now, pnl, position_id))
                     
+                    # Add balance
                     cur.execute("""
-                        UPDATE accounts SET current_balance = current_balance + %s, updated_at = NOW()
+                        UPDATE accounts SET current_balance = current_balance + %s
                         WHERE id = %s
                     """, (proceeds, account_id))
+                    
+                    # Create order
+                    cur.execute("""
+                        INSERT INTO orders (account_id, market_id, strategy_id, side, type,
+                                           quantity, price, filled_quantity, avg_fill_price,
+                                           status, filled_at)
+                        VALUES (%s, %s, %s, 'SELL', 'MARKET', %s, %s, %s, %s, 'FILLED', %s)
+                        RETURNING id
+                    """, (account_id, market_id, strategy_id, quantity, current_price,
+                          quantity, current_price, now))
                     
                     is_win = pnl > 0
                     
@@ -501,7 +574,7 @@ def execute_paper_order(account_id: str, market_id: str, signal: Signal,
                                 ELSE cooldown_until 
                             END,
                             updated_at = NOW()
-                        WHERE account_id = %s AND strategy_id = %s
+                        WHERE strategy_instance_id = %s
                     """, (
                         1 if is_win else 0,
                         0 if is_win else 1,
@@ -511,12 +584,11 @@ def execute_paper_order(account_id: str, market_id: str, signal: Signal,
                         is_win,
                         MAX_CONSECUTIVE_LOSSES,
                         COOLDOWN_HOURS,
-                        account_id, strategy_id
+                        instance_id
                     ))
                     
-                    logger.info(f"Closed LONG position: {quantity} @ {current_price}, PnL: {pnl:.4f}")
-                    
-                    log_trade(account_id, order_id, position_id, "CLOSE_LONG", {
+                    logger.info(f"Closed LONG: {quantity} @ {current_price}, PnL: {pnl:.4f}")
+                    log_trade(account_id, None, position_id, "CLOSE_LONG", {
                         "symbol": signal.symbol,
                         "quantity": str(quantity),
                         "entry_price": str(entry_price),
@@ -530,20 +602,17 @@ def execute_paper_order(account_id: str, market_id: str, signal: Signal,
                 return True
                 
     except Exception as e:
-        logger.error(f"Failed to execute order: {e}")
-        log_error("worker", f"Order execution failed: {e}", str(e), {
-            "account_id": account_id,
-            "market_id": market_id,
-            "signal": str(signal.signal_type.value)
-        })
+        logger.error(f"Order execution failed: {e}")
+        log_error("worker", f"Order failed: {e}", str(e), {})
         return False
 
 
 def ensure_strategy_instances(account_id: str) -> List[StrategyInstance]:
-    """Ensure strategy instances exist and return them."""
+    """Create/return strategy instances with correct intervals."""
     strategies_config = [
         {
             "strategy_id": "late-entry-v1",
+            "interval": "1m",
             "interval_minutes": 1,
             "parameters": {
                 "positionCapUsd": float(POSITION_CAP_USD),
@@ -556,7 +625,8 @@ def ensure_strategy_instances(account_id: str) -> List[StrategyInstance]:
         },
         {
             "strategy_id": "trend-following-v1",
-            "interval_minutes": 240,  # 4 hours
+            "interval": "4h",
+            "interval_minutes": 240,
             "parameters": {
                 "positionCapUsd": float(POSITION_CAP_USD),
                 "adxThreshold": 25,
@@ -568,6 +638,7 @@ def ensure_strategy_instances(account_id: str) -> List[StrategyInstance]:
         },
         {
             "strategy_id": "mean-reversion-v1",
+            "interval": "15m",
             "interval_minutes": 15,
             "parameters": {
                 "positionCapUsd": float(POSITION_CAP_USD),
@@ -588,6 +659,7 @@ def ensure_strategy_instances(account_id: str) -> List[StrategyInstance]:
         with conn.cursor() as cur:
             for config in strategies_config:
                 strategy_id = config["strategy_id"]
+                interval = config["interval"]
                 
                 # Check for existing instance
                 cur.execute("""
@@ -610,18 +682,21 @@ def ensure_strategy_instances(account_id: str) -> List[StrategyInstance]:
                     instance_id = str(row["id"])
                     params = config["parameters"]
                     
-                    # Ensure strategy_state row exists
+                    # Create strategy_state with instance_id
                     cur.execute("""
-                        INSERT INTO strategy_state (account_id, strategy_id, consecutive_losses, total_trades, winning_trades, total_pnl)
-                        VALUES (%s, %s, 0, 0, 0, 0)
-                        ON CONFLICT (account_id, strategy_id) DO NOTHING
-                    """, (account_id, strategy_id))
+                        INSERT INTO strategy_state 
+                            (account_id, strategy_id, strategy_instance_id, 
+                             consecutive_losses, total_trades, winning_trades, total_pnl)
+                        VALUES (%s, %s, %s, 0, 0, 0, 0)
+                        ON CONFLICT (account_id, strategy_id) 
+                        DO UPDATE SET strategy_instance_id = EXCLUDED.strategy_instance_id
+                    """, (account_id, strategy_id, instance_id))
                     
                     conn.commit()
-                    logger.info(f"Created strategy instance: {strategy_id}")
+                    logger.info(f"Created strategy instance: {strategy_id} ({interval})")
                 
                 # Get state
-                state = get_strategy_state(account_id, strategy_id)
+                state = get_strategy_state(instance_id)
                 
                 # Create strategy object
                 strategy_class = STRATEGY_REGISTRY.get(strategy_id)
@@ -636,8 +711,10 @@ def ensure_strategy_instances(account_id: str) -> List[StrategyInstance]:
                     account_id=account_id,
                     strategy_id=strategy_id,
                     parameters=params,
+                    interval=interval,
                     interval_seconds=config["interval_minutes"] * 60,
                     last_run=None,
+                    last_candle_time=None,
                     state=state,
                     strategy_obj=strategy_obj
                 ))
@@ -645,9 +722,9 @@ def ensure_strategy_instances(account_id: str) -> List[StrategyInstance]:
     return instances
 
 
-def run_strategy(instance: StrategyInstance, symbol: str, market_id: str, 
+def run_strategy(instance: StrategyInstance, symbol: str, market_id: str,
                  market_data: MarketData, candle_history: List[MarketData]):
-    """Run a single strategy instance."""
+    """Run a single strategy."""
     # Check cooldown
     if instance.state.get("cooldown_until"):
         cooldown_until = instance.state["cooldown_until"]
@@ -655,7 +732,7 @@ def run_strategy(instance: StrategyInstance, symbol: str, market_id: str,
             cooldown_until = datetime.fromisoformat(cooldown_until.replace("Z", "+00:00"))
         
         if datetime.utcnow() < cooldown_until.replace(tzinfo=None):
-            logger.debug(f"{instance.strategy_id} in cooldown until {cooldown_until}")
+            logger.debug(f"{instance.strategy_id} in cooldown")
             return
     
     # Check circuit breaker
@@ -663,13 +740,9 @@ def run_strategy(instance: StrategyInstance, symbol: str, market_id: str,
         logger.debug(f"{instance.strategy_id} circuit breaker active")
         return
     
-    # Get positions for this market
-    positions = get_open_positions(instance.account_id, market_id)
-    
-    # Feed history to strategy if it tracks it internally
+    # Feed history to strategy
     strategy = instance.strategy_obj
     
-    # For strategies that need history, feed them
     if hasattr(strategy, 'closes') and len(strategy.closes) == 0:
         for candle in candle_history:
             if hasattr(strategy, 'highs'):
@@ -682,37 +755,32 @@ def run_strategy(instance: StrategyInstance, symbol: str, market_id: str,
                 strategy.price_history.append(candle.close)
     
     # Run strategy
-    signal = strategy.on_data(market_data, positions)
+    signal = strategy.on_data(market_data, get_open_positions(instance.account_id, market_id))
     
     if signal:
-        logger.info(f"[{instance.strategy_id}] Signal: {signal.signal_type.value} {signal.symbol} "
-                   f"qty={signal.quantity} reason={signal.reason}")
+        logger.info(f"[{instance.strategy_id}] {signal.signal_type.value} {symbol} "
+                   f"qty={signal.quantity:.6f} reason={signal.reason}")
         
-        # Execute paper order
-        execute_paper_order(
-            instance.account_id, market_id, signal,
-            instance.strategy_id, market_data.close
-        )
-        
-        # Update strategy state from strategy instance
-        if hasattr(strategy, 'state'):
-            instance.state = strategy.state
-            update_strategy_state(instance.account_id, instance.strategy_id, instance.state)
+        if execute_paper_order(instance.account_id, market_id, signal,
+                              instance.strategy_id, instance.id, market_data.close):
+            if hasattr(strategy, 'state'):
+                instance.state = strategy.state
+                update_strategy_state(instance.id, instance.state)
 
 
-def run_strategy_loop():
-    """Main strategy execution loop."""
-    logger.info("Starting multi-strategy runner...")
+def run_event_driven_loop():
+    """Main event-driven loop."""
+    logger.info("Starting event-driven strategy runner...")
     
-    # Ensure account exists
+    # Ensure account
     account_id = ensure_active_account()
     if not account_id:
-        logger.error("No active account available")
+        logger.error("No active account")
         return
     
-    logger.info(f"Using account: {account_id}")
+    logger.info(f"Account: {account_id}")
     
-    # Get market IDs
+    # Get markets
     markets = {}
     for symbol in ["BTC-USD", "ETH-USD"]:
         market_id = get_market_id(symbol)
@@ -721,84 +789,96 @@ def run_strategy_loop():
             logger.info(f"Market {symbol}: {market_id}")
     
     if not markets:
-        logger.error("No markets available")
+        logger.error("No markets")
         return
     
-    # Ensure strategy instances
+    # Create strategy instances
     instances = ensure_strategy_instances(account_id)
-    logger.info(f"Active strategies: {[i.strategy_id for i in instances]}")
+    logger.info(f"Strategies: {[(i.strategy_id, i.interval) for i in instances]}")
     
-    # Main loop
-    logger.info("Starting main loop (1s tick)")
+    # Track last processed candle per market
+    last_candles: Dict[str, datetime] = {}
+    
+    logger.info("Starting main loop")
     
     while True:
         try:
             now = datetime.utcnow()
             
-            # For each market
+            # Process each market
             for symbol, market_id in markets.items():
-                # Get or create candle
-                market_data = get_or_create_candle(market_id, symbol)
-                if not market_data:
+                # Insert 1m candle
+                candle_time, is_new = insert_1m_candle(market_id, symbol)
+                
+                if candle_time is None:
                     continue
                 
-                # Get candle history for indicators
-                candle_history = get_candle_history(market_id, limit=50)
-                
-                # Calculate and save indicators
-                if len(candle_history) >= 28:
-                    highs = [c.high for c in candle_history]
-                    lows = [c.low for c in candle_history]
-                    closes = [c.close for c in candle_history]
+                # If new 1m candle, aggregate and compute indicators
+                if is_new:
+                    # Aggregate to higher timeframes
+                    aggregate_timeframes(market_id)
                     
-                    adx_result = calculate_adx(highs, lows, closes)
-                    adx_val = None
-                    bb_data = None
+                    # Compute 1m indicators
+                    compute_and_save_indicators(market_id, "1m", candle_time)
                     
-                    if adx_result:
-                        adx, plus_di, minus_di = adx_result
-                        trend = get_trend_direction(adx, plus_di, minus_di)
-                        adx_val = float(adx)
-                        
-                        bb_result = calculate_bollinger_bands(closes)
-                        if bb_result:
-                            upper, middle, lower, width = bb_result
-                            bb_data = {
-                                "upper": float(upper),
-                                "middle": float(middle),
-                                "lower": float(lower),
-                                "width": float(width),
-                                "trend": trend
-                            }
-                        
-                        save_market_indicators(market_id, market_data, adx_val, bb_data)
+                    # Check if we completed higher timeframe buckets
+                    if candle_time.minute == 0:
+                        # Completed 1h bucket
+                        compute_and_save_indicators(market_id, "1h", 
+                            candle_time.replace(minute=0, second=0))
+                    
+                    if candle_time.minute % 15 == 0:
+                        # Completed 15m bucket
+                        compute_and_save_indicators(market_id, "15m",
+                            candle_time.replace(minute=(candle_time.minute // 15) * 15, second=0))
+                    
+                    if candle_time.minute % 240 == 0:
+                        # Completed 4h bucket
+                        bucket_start = get_bucket_start(candle_time, 240)
+                        compute_and_save_indicators(market_id, "4h", bucket_start)
                 
-                # Run each strategy if interval elapsed
+                last_candles[market_id] = candle_time
+                
+                # Run strategies based on their interval
                 for instance in instances:
+                    # Check if strategy should run based on interval
                     if instance.last_run is None or \
                        (now - instance.last_run).total_seconds() >= instance.interval_seconds:
                         
-                        run_strategy(instance, symbol, market_id, market_data, candle_history)
-                        instance.last_run = now
+                        # Get candles for strategy's interval
+                        history = get_candle_history(market_id, instance.interval, limit=50)
+                        
+                        if not history:
+                            continue
+                        
+                        # Get latest candle data for this interval
+                        latest = history[-1] if history else None
+                        if latest:
+                            run_strategy(instance, symbol, market_id, latest, history)
+                            instance.last_run = now
+                            instance.last_candle_time = datetime.fromtimestamp(latest.timestamp / 1000)
             
-            # Sleep for 1 second
-            time.sleep(1)
+            # Sleep until next minute boundary
+            next_minute = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+            sleep_seconds = (next_minute - datetime.utcnow()).total_seconds()
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
             
         except KeyboardInterrupt:
             logger.info("Shutting down...")
             break
         except Exception as e:
-            logger.error(f"Error in strategy loop: {e}")
-            log_error("worker", f"Strategy loop error: {e}", str(e), {})
+            logger.error(f"Loop error: {e}")
+            log_error("worker", f"Loop error: {e}", str(e), {})
             time.sleep(5)
 
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("Polypaper Multi-Strategy Worker Starting (Phase 2A)")
+    logger.info("Polypaper Worker (Phase 2.1) - Event-Driven")
     logger.info(f"Position Cap: ${POSITION_CAP_USD}")
     logger.info(f"Max Losses: {MAX_CONSECUTIVE_LOSSES}")
     logger.info(f"Cooldown: {COOLDOWN_HOURS}h")
     logger.info("=" * 60)
     
-    run_strategy_loop()
+    run_event_driven_loop()

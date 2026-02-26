@@ -98,12 +98,12 @@ CREATE TABLE strategy_instances (
 );
 
 -- Strategy state (consecutive losses, cooldown, etc.)
--- Updated for Phase 2A: per-instance state tracking
+-- Updated for Phase 2.1: per-instance state tracking with unique constraint
 CREATE TABLE strategy_state (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   account_id UUID NOT NULL REFERENCES accounts(id),
   strategy_id VARCHAR(100) NOT NULL,
-  strategy_instance_id UUID REFERENCES strategy_instances(id),
+  strategy_instance_id UUID UNIQUE REFERENCES strategy_instances(id),  -- One state per instance
   consecutive_losses INT DEFAULT 0,
   last_loss_at TIMESTAMPTZ,
   cooldown_until TIMESTAMPTZ,
@@ -113,6 +113,8 @@ CREATE TABLE strategy_state (
   total_pnl DECIMAL(18,8) DEFAULT 0,
   max_drawdown DECIMAL(10,4) DEFAULT 0,
   peak_pnl DECIMAL(18,8) DEFAULT 0,
+  last_candle_at TIMESTAMPTZ,  -- Track data freshness
+  last_run_at TIMESTAMPTZ,     -- Track when strategy last ran
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(account_id, strategy_id)
 );
