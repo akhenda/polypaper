@@ -305,6 +305,11 @@ def compute_and_save_indicators(market_id: str, interval: str, candle_time: date
     lows = [c.low for c in candles]
     closes = [c.close for c in candles]
     
+    # Log min/max for sanity check
+    logger.debug(f"{interval} candle range: H [{min(highs):.2f}, {max(highs):.2f}], "
+                 f"L [{min(lows):.2f}, {max(lows):.2f}], "
+                 f"C [{min(closes):.2f}, {max(closes):.2f}]")
+    
     # Calculate indicators
     adx_result = calculate_adx(highs, lows, closes, period=14)
     bb_result = calculate_bollinger_bands(closes, period=20, num_std=2.0)
@@ -319,6 +324,10 @@ def compute_and_save_indicators(market_id: str, interval: str, candle_time: date
         adx, plus_di, minus_di = adx_result
         adx_val = float(adx)
         adx_trend = get_trend_direction(adx, plus_di, minus_di)
+        
+        # Sanity check: ADX should be in [0, 100]
+        if adx_val < 0 or adx_val > 100:
+            logger.warning(f"ADX sanity check failed: {adx_val} outside [0,100] for {interval}")
     
     if bb_result:
         upper, middle, lower, width = bb_result
@@ -329,6 +338,10 @@ def compute_and_save_indicators(market_id: str, interval: str, candle_time: date
     
     if rsi_result:
         rsi_val = float(rsi_result)
+        
+        # Sanity check: RSI should be in [0, 100]
+        if rsi_val < 0 or rsi_val > 100:
+            logger.warning(f"RSI sanity check failed: {rsi_val} outside [0,100] for {interval}")
     
     # Save to database
     with get_db_connection() as conn:
@@ -353,7 +366,11 @@ def compute_and_save_indicators(market_id: str, interval: str, candle_time: date
             ))
             conn.commit()
     
-    logger.info(f"Computed {interval} indicators: ADX={adx_val}, BB_width={bb_width}, RSI={rsi_val}")
+    # Log with sanity status
+    sanity_ok = (adx_val is None or (0 <= adx_val <= 100)) and \
+                (rsi_val is None or (0 <= rsi_val <= 100))
+    sanity_str = "✓" if sanity_ok else "⚠"
+    logger.info(f"Computed {interval} indicators {sanity_str}: ADX={adx_val}, BB_width={bb_width}, RSI={rsi_val}")
 
 
 def get_latest_indicators(market_id: str, interval: str) -> Optional[Dict]:

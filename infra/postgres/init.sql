@@ -98,12 +98,12 @@ CREATE TABLE strategy_instances (
 );
 
 -- Strategy state (consecutive losses, cooldown, etc.)
--- Updated for Phase 2.1: per-instance state tracking with unique constraint
+-- Updated for Phase 2.1.1: true per-instance state (multiple instances of same strategy allowed)
 CREATE TABLE strategy_state (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   account_id UUID NOT NULL REFERENCES accounts(id),
   strategy_id VARCHAR(100) NOT NULL,
-  strategy_instance_id UUID UNIQUE REFERENCES strategy_instances(id),  -- One state per instance
+  strategy_instance_id UUID NOT NULL UNIQUE REFERENCES strategy_instances(id),  -- Required, one state per instance
   consecutive_losses INT DEFAULT 0,
   last_loss_at TIMESTAMPTZ,
   cooldown_until TIMESTAMPTZ,
@@ -115,8 +115,8 @@ CREATE TABLE strategy_state (
   peak_pnl DECIMAL(18,8) DEFAULT 0,
   last_candle_at TIMESTAMPTZ,  -- Track data freshness
   last_run_at TIMESTAMPTZ,     -- Track when strategy last ran
-  updated_at TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE(account_id, strategy_id)
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+  -- Removed UNIQUE(account_id, strategy_id) to allow multiple instances per account
 );
 
 -- Market indicators (ADX, Bollinger Bands, etc.)

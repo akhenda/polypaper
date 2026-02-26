@@ -1,6 +1,27 @@
 import { FastifyInstance } from 'fastify';
 import { db } from '../index.js';
 
+// Helper to check indicator sanity
+function checkIndicatorSanity(indicators: any): { valid: boolean; alerts: string[] } {
+  const alerts: string[] = [];
+  
+  if (!indicators) {
+    return { valid: true, alerts: [] };
+  }
+  
+  const adx = parseFloat(indicators.adx) || 0;
+  const rsi = parseFloat(indicators.rsi) || 0;
+  
+  if (adx < 0 || adx > 100) {
+    alerts.push(`ADX=${adx} is outside valid range [0, 100]`);
+  }
+  if (rsi < 0 || rsi > 100) {
+    alerts.push(`RSI=${rsi} is outside valid range [0, 100]`);
+  }
+  
+  return { valid: alerts.length === 0, alerts };
+}
+
 export default async function indicatorsRoutes(app: FastifyInstance) {
   // Get latest indicators for a market
   app.get<{
@@ -50,10 +71,73 @@ export default async function indicatorsRoutes(app: FastifyInstance) {
         };
       }
       
+      const indicators = res.rows[0];
+      const sanity = checkIndicatorSanity(indicators);
+      
       return {
         market_id: marketIdValue,
         interval,
-        indicators: res.rows[0]
+        indicators,
+        sanity: sanity.valid ? 'ok' : 'warning',
+        alerts: sanity.alerts.length > 0 ? sanity.alerts : undefined
+      };
+    } finally {
+      client.release();
+    }
+  });
+
+  // Get indicator sanity summary for all markets
+  app.get('/indicators/sanity', async (request) => {
+    const client = await db.connect();
+    try {
+      // Get latest indicators for all markets/intervals
+      const res = await client.query(`
+        WITH latest AS (
+          SELECT DISTINCT ON (market_id, interval)
+            market_id, interval, timestamp, adx, rsi, adx_trend
+          FROM market_indicators
+          ORDER BY market_id, interval, timestamp DESC
+        )
+        SELECT 
+          l.*,
+          m.symbol,
+          m.name as market_name,
+          CASE 
+            WHEN l.adx::numeric < 0 OR l.adx::numeric > 100 THEN true
+            WHEN l.rsi::numeric < 0 OR l.rsi::numeric > 100 THEN true
+            ELSE false
+          END as has_alert
+        FROM latest l
+        JOIN markets m ON l.market_id = m.id
+        ORDER BY m.symbol, l.interval
+      `);
+      
+      const alerts = res.rows.filter(r => r.has_alert);
+      
+      return {
+        total_indicators: res.rows.length,
+        alert_count: alerts.length,
+        status: alerts.length === 0 ? 'all_ok' : 'has_warnings',
+        alerts: alerts.map(a => ({
+          symbol: a.symbol,
+          interval: a.interval,
+          timestamp: a.timestamp,
+          adx: a.adx,
+          rsi: a.rsi,
+          issues: [
+            ...(parseFloat(a.adx) < 0 || parseFloat(a.adx) > 100 ? [`ADX=${a.adx}`] : []),
+            ...(parseFloat(a.rsi) < 0 || parseFloat(a.rsi) > 100 ? [`RSI=${a.rsi}`] : [])
+          ].join(', ')
+        })),
+        all_indicators: res.rows.map(r => ({
+          symbol: r.symbol,
+          interval: r.interval,
+          timestamp: r.timestamp,
+          adx: r.adx,
+          adx_trend: r.adx_trend,
+          rsi: r.rsi,
+          has_alert: r.has_alert
+        }))
       };
     } finally {
       client.release();
