@@ -29,6 +29,10 @@ def get_db_connection(database_url: str):
 
 def get_bucket_start(timestamp: datetime, interval_minutes: int) -> datetime:
     """Calculate the start of the bucket for a given timestamp."""
+    # Ensure we're working with naive datetime (UTC)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.replace(tzinfo=None)
+    
     # Round down to the nearest interval
     total_minutes = timestamp.hour * 60 + timestamp.minute
     bucket_minutes = (total_minutes // interval_minutes) * interval_minutes
@@ -104,7 +108,11 @@ def aggregate_candles(
             # Group candles by bucket
             buckets: Dict[datetime, List] = {}
             for candle in candles:
-                bucket_start = get_bucket_start(candle["timestamp"], interval_minutes)
+                ts = candle["timestamp"]
+                # Strip timezone for comparison
+                if ts.tzinfo is not None:
+                    ts = ts.replace(tzinfo=None)
+                bucket_start = get_bucket_start(ts, interval_minutes)
                 if bucket_start not in buckets:
                     buckets[bucket_start] = []
                 buckets[bucket_start].append(candle)
@@ -112,6 +120,10 @@ def aggregate_candles(
             # Create aggregated candles for complete buckets only
             now = datetime.utcnow()
             current_bucket = get_bucket_start(now, interval_minutes)
+            
+            # Also strip tz from latest_bucket if present
+            if latest_bucket and latest_bucket.tzinfo is not None:
+                latest_bucket = latest_bucket.replace(tzinfo=None)
             
             for bucket_start, bucket_candles in sorted(buckets.items()):
                 # Skip the current (incomplete) bucket
