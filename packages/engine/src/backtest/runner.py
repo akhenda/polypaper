@@ -352,17 +352,21 @@ def save_backtest_result(result: BacktestResult, market_ids: List[str], database
                 for t in result.trades
             ]
             
+            # Convert market_ids to proper UUID format
+            import uuid
+            market_uuids = [str(uuid.UUID(mid)) for mid in market_ids]
+            
             cur.execute("""
                 INSERT INTO backtests 
                     (strategy_id, parameters, market_ids, start_date, end_date,
                      initial_capital, final_capital, total_return, sharpe_ratio,
                      max_drawdown, win_rate, trade_count, equity_curve, trades, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'COMPLETED')
+                VALUES (%s, %s, %s::uuid[], %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'COMPLETED')
                 RETURNING id
             """, (
                 result.strategy_id,
                 json.dumps({}),
-                market_ids,
+                market_uuids,
                 result.start_date,
                 result.end_date,
                 result.initial_capital,
