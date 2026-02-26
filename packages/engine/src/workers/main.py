@@ -22,7 +22,8 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from strategies.base import MarketData, Position, Signal, SignalType
-from strategies.examples import STRATEGY_REGISTRY, LateEntryStrategy, TrendFollowingStrategy, MeanReversionStrategy
+from strategies import STRATEGY_REGISTRY
+from strategies.examples import LateEntryStrategy, TrendFollowingStrategy, MeanReversionStrategy
 from indicators.adx import calculate_adx, get_trend_direction
 from indicators.bollinger import calculate_bollinger_bands
 
