@@ -98,19 +98,42 @@ CREATE TABLE strategy_instances (
 );
 
 -- Strategy state (consecutive losses, cooldown, etc.)
+-- Updated for Phase 2A: per-instance state tracking
 CREATE TABLE strategy_state (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   account_id UUID NOT NULL REFERENCES accounts(id),
   strategy_id VARCHAR(100) NOT NULL,
+  strategy_instance_id UUID REFERENCES strategy_instances(id),
   consecutive_losses INT DEFAULT 0,
   last_loss_at TIMESTAMPTZ,
   cooldown_until TIMESTAMPTZ,
   total_trades INT DEFAULT 0,
   winning_trades INT DEFAULT 0,
+  total_losses INT DEFAULT 0,
   total_pnl DECIMAL(18,8) DEFAULT 0,
+  max_drawdown DECIMAL(10,4) DEFAULT 0,
+  peak_pnl DECIMAL(18,8) DEFAULT 0,
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(account_id, strategy_id)
 );
+
+-- Market indicators (ADX, Bollinger Bands, etc.)
+CREATE TABLE market_indicators (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  market_id UUID NOT NULL REFERENCES markets(id) ON DELETE CASCADE,
+  interval VARCHAR(10) NOT NULL,
+  timestamp TIMESTAMPTZ NOT NULL,
+  adx DECIMAL(10,4),           -- Average Directional Index
+  adx_trend VARCHAR(10),       -- BULLISH, BEARISH, NEUTRAL
+  bb_upper DECIMAL(18,8),      -- Bollinger Band upper
+  bb_middle DECIMAL(18,8),     -- Bollinger Band middle (SMA)
+  bb_lower DECIMAL(18,8),      -- Bollinger Band lower
+  bb_width DECIMAL(10,4),      -- Band width as % of middle
+  rsi DECIMAL(10,4),           -- Relative Strength Index
+  metadata JSONB DEFAULT '{}', -- Additional indicators
+  UNIQUE(market_id, interval, timestamp)
+);
+CREATE INDEX idx_indicators_market_time ON market_indicators(market_id, timestamp DESC);
 
 -- Backtest results
 CREATE TABLE backtests (
